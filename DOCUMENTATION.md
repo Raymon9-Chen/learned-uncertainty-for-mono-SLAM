@@ -245,6 +245,189 @@ $$\frac{\partial L_{focal}}{\partial z} = \alpha_t \left[ \gamma (1-p_t)^{\gamma
 
 The additional $(1-p_t)^\gamma$ term reduces gradients for well-classified examples, focusing learning on hard cases.
 
+### Self-Supervised Loss: Feature Stability Loss
+
+The **Feature Stability Loss** provides self-supervised training signals by measuring image quality through feature extraction stability. This loss is fully differentiable and operates without explicit labels.
+
+#### Components of Feature Stability Loss
+
+The feature stability loss combines three differentiable components:
+
+$$L_{feature} = w_s L_{sharpness} + w_g L_{gradient} + w_c L_{corner}$$
+
+Where $w_s$, $w_g$, and $w_c$ are component weights (default: equal weighting).
+
+#### 1. Sharpness Loss via Laplacian Variance
+
+Sharpness is measured using the **Laplacian variance**, a classical focus measure:
+
+$$\nabla^2 I = \frac{\partial^2 I}{\partial x^2} + \frac{\partial^2 I}{\partial y^2}$$
+
+Implemented as a 2D convolution with kernel:
+
+$$K_{Laplacian} = \begin{bmatrix} 0 & 1 & 0 \\ 1 & -4 & 1 \\ 0 & 1 & 0 \end{bmatrix}$$
+
+The sharpness score is the variance of the Laplacian response:
+
+$$S(I) = \text{Var}(\nabla^2 I) = \mathbb{E}[(\nabla^2 I)^2] - (\mathbb{E}[\nabla^2 I])^2$$
+
+**Differentiability**: Since convolution and variance are differentiable operations:
+
+$$\frac{\partial S}{\partial I} = \frac{\partial S}{\partial (\nabla^2 I)} \cdot \frac{\partial (\nabla^2 I)}{\partial I} = \frac{\partial S}{\partial (\nabla^2 I)} \cdot K_{Laplacian}^T$$
+
+The loss encourages high Laplacian variance (sharp images) for frames classified as good:
+
+$$L_{sharpness} = \text{MSE}(S_{normalized}, y_{target})$$
+
+#### 2. Gradient Magnitude Loss via Sobel Operators
+
+Gradient magnitude measures edge strength using **Sobel operators**:
+
+$$G_x = \begin{bmatrix} -1 & 0 & 1 \\ -2 & 0 & 2 \\ -1 & 0 & 1 \end{bmatrix} * I, \quad G_y = \begin{bmatrix} -1 & -2 & -1 \\ 0 & 0 & 0 \\ 1 & 2 & 1 \end{bmatrix} * I$$
+
+The gradient magnitude:
+
+$$G = \sqrt{G_x^2 + G_y^2}$$
+
+Mean gradient magnitude is computed and compared to target:
+
+$$L_{gradient} = \text{MSE}(\bar{G}_{normalized}, y_{target})$$
+
+**Gradient Flow**: The Sobel convolutions are implemented as `F.conv2d` operations, enabling automatic differentiation:
+
+$$\frac{\partial L_{gradient}}{\partial I} = \frac{\partial L}{\partial G} \cdot \frac{G_x}{G} \cdot G_{sobel\_x}^T + \frac{\partial L}{\partial G} \cdot \frac{G_y}{G} \cdot G_{sobel\_y}^T$$
+
+#### 3. Corner Response Loss (Differentiable Harris Corners)
+
+The **Harris corner detector** response provides a measure of texture richness:
+
+$$M = \begin{bmatrix} \sum I_x^2 & \sum I_x I_y \\ \sum I_x I_y & \sum I_y^2 \end{bmatrix}$$
+
+The Harris response function:
+
+$$R = \det(M) - k \cdot \text{trace}(M)^2 = \lambda_1 \lambda_2 - k(\lambda_1 + \lambda_2)^2$$
+
+Where $k \approx 0.04$ is the Harris sensitivity parameter.
+
+**Implementation for Differentiability**:
+
+```python
+# Compute products of gradients
+Ixx = Ix * Ix  # Element-wise, differentiable
+Ixy = Ix * Iy
+Iyy = Iy * Iy
+
+# Window summation via average pooling (differentiable)
+Sxx = F.avg_pool2d(Ixx, kernel_size=3, padding=1) * 9
+Sxy = F.avg_pool2d(Ixy, kernel_size=3, padding=1) * 9
+Syy = F.avg_pool2d(Iyy, kernel_size=3, padding=1) * 9
+
+# Harris response (all differentiable operations)
+det = Sxx * Syy - Sxy * Sxy
+trace = Sxx + Syy
+R = det - k * trace * trace
+```
+
+The corner loss measures feature point availability:
+
+$$L_{corner} = \text{MSE}(\bar{R}_{normalized}, y_{target})$$
+
+### Self-Supervised Loss: Photometric Consistency Loss
+
+The **Photometric Consistency Loss** measures image quality through photometric properties, enabling self-supervised learning without explicit labels.
+
+$$L_{photometric} = w_{ssim} L_{SSIM} + w_{hist} L_{histogram} + w_{bright} L_{brightness}$$
+
+#### 1. Structural Similarity Index (SSIM) Loss
+
+**SSIM** measures structural similarity between an image and a reference (or self-comparison for quality):
+
+$$\text{SSIM}(x, y) = \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}{(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}$$
+
+Where:
+- $\mu_x, \mu_y$ are local means (computed via average pooling)
+- $\sigma_x^2, \sigma_y^2$ are local variances
+- $\sigma_{xy}$ is the local covariance
+- $C_1 = (0.01 \cdot L)^2$, $C_2 = (0.03 \cdot L)^2$ are stabilization constants
+
+**Differentiable Implementation**:
+
+```python
+def ssim(img1, img2, window_size=11):
+    # Gaussian-weighted local means (via conv2d - differentiable)
+    mu1 = F.conv2d(img1, gaussian_kernel, padding=pad, groups=C)
+    mu2 = F.conv2d(img2, gaussian_kernel, padding=pad, groups=C)
+    
+    # Local statistics (all differentiable)
+    mu1_sq, mu2_sq = mu1.pow(2), mu2.pow(2)
+    sigma1_sq = F.conv2d(img1*img1, gaussian_kernel, ...) - mu1_sq
+    sigma2_sq = F.conv2d(img2*img2, gaussian_kernel, ...) - mu2_sq
+    sigma12 = F.conv2d(img1*img2, gaussian_kernel, ...) - mu1*mu2
+    
+    # SSIM formula (differentiable)
+    ssim_map = ((2*mu1*mu2 + C1)*(2*sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
+```
+
+The SSIM loss:
+
+$$L_{SSIM} = 1 - \text{SSIM}(I, I_{ref})$$
+
+**Gradient Properties**: SSIM gradients flow through:
+1. Gaussian convolutions (linear, smooth gradients)
+2. Element-wise products and divisions (smooth where denominators ≠ 0)
+3. Mean reduction (simple averaging)
+
+#### 2. Histogram Distance Loss
+
+While traditional histogram comparison is non-differentiable (due to binning), we approximate it using **soft histogram binning**:
+
+$$h_b(I) = \sum_p \max(0, 1 - |I_p - b_{center}| / b_{width})$$
+
+This creates differentiable bin counts. The loss measures histogram uniformity:
+
+$$L_{histogram} = \text{Var}(h(I)) / \mathbb{E}[h(I)]$$
+
+Well-exposed images have balanced histograms (low coefficient of variation).
+
+#### 3. Brightness Consistency Loss
+
+Measures deviation from optimal brightness:
+
+$$L_{brightness} = (\mu_I - \mu_{target})^2$$
+
+Where $\mu_{target} = 0.5$ (for normalized [0,1] images) represents optimal exposure.
+
+**Gradient**:
+
+$$\frac{\partial L_{brightness}}{\partial I} = \frac{2(\mu_I - \mu_{target})}{N}$$
+
+Simple linear gradients enable stable optimization.
+
+### Combined Uncertainty Loss
+
+The complete uncertainty training objective combines all losses:
+
+$$L_{total} = w_{class} L_{BCE} + w_{feature} L_{feature} + w_{photo} L_{photometric} + \lambda L_{reg}$$
+
+**Default Weights**:
+- $w_{class} = 1.0$ (classification supervision)
+- $w_{feature} = 0.3$ (feature stability)
+- $w_{photo} = 0.3$ (photometric consistency)
+- $\lambda = 10^{-4}$ (L2 regularization)
+
+**Training Modes**:
+
+1. **Supervised Training**: Use $L_{BCE}$ with labeled blur/sharp data
+2. **Self-Supervised Training**: Use $L_{feature} + L_{photometric}$ without labels
+3. **Hybrid Training**: Combine all losses (default configuration)
+
+The self-supervised losses enable:
+- Training on unlabeled video sequences
+- Domain adaptation to new camera systems
+- Online fine-tuning during SLAM operation
+
 ### Regularization Losses
 
 #### L2 Weight Decay
@@ -259,13 +442,31 @@ $$\frac{\partial L_{reg}}{\partial \theta} = \lambda \theta$$
 
 This is implemented efficiently via the `weight_decay` parameter in the optimizer.
 
-### Total Loss
+### Summary: Complete Differentiable Loss Hierarchy
 
-The complete training objective combines all losses:
+```
+L_total
+├── L_BCE (Binary Cross-Entropy)           [Supervised]
+│   └── Gradient: σ(z) - y
+├── L_feature (Feature Stability)          [Self-Supervised]
+│   ├── L_sharpness (Laplacian variance)
+│   │   └── Via F.conv2d with Laplacian kernel
+│   ├── L_gradient (Sobel magnitude)
+│   │   └── Via F.conv2d with Sobel kernels
+│   └── L_corner (Harris response)
+│       └── Via F.avg_pool2d and element-wise ops
+├── L_photometric (Photometric Consistency) [Self-Supervised]
+│   ├── L_SSIM (Structural similarity)
+│   │   └── Via Gaussian conv2d and statistics
+│   ├── L_histogram (Distribution balance)
+│   │   └── Via soft binning approximation
+│   └── L_brightness (Exposure consistency)
+│       └── Via mean computation
+└── L_reg (L2 Regularization)              [Regularization]
+    └── Via optimizer weight_decay
+```
 
-$$L_{total} = L_{BCE} + \lambda_{reg} L_{reg}$$
-
-Where $\lambda_{reg}$ is the weight decay coefficient (typically $10^{-4}$).
+All components maintain gradient flow through PyTorch's autograd system, enabling end-to-end training.
 
 ---
 
